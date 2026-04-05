@@ -98,6 +98,7 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
     """
     if use_mlx():
         import mlx.core as mx
+
         # Start capturing to a temp file. We will rename it in stop_profile.
         mx.metal.start_capture("sglang_tmp.gputrace")
         rank_print("MLX Metal capture started")
@@ -142,8 +143,9 @@ def stop_profile(
     Optionally saves trace results and prints completion messages.
     """
     if profiler == "mlx":
-        import mlx.core as mx
         import shutil
+
+        import mlx.core as mx
 
         mx.metal.stop_capture()
 
