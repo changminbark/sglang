@@ -66,7 +66,6 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -97,6 +96,13 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
     Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None).
     """
+    if use_mlx():
+        import mlx.core as mx
+        # Start capturing to a temp file. We will rename it in stop_profile.
+        mx.metal.start_capture("sglang_tmp.gputrace")
+        rank_print("MLX Metal capture started")
+        return "mlx"
+
     if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStart()
@@ -135,6 +141,25 @@ def stop_profile(
     Abstracted function to stop profiling based on profile_activities.
     Optionally saves trace results and prints completion messages.
     """
+    if profiler == "mlx":
+        import mlx.core as mx
+        import shutil
+
+        mx.metal.stop_capture()
+
+        if save_trace and trace_filename:
+            # Change SGLang's default torch extension to Apple's .gputrace extension
+            mlx_trace_filename = trace_filename.replace(".trace.json.gz", ".gputrace")
+
+            # Replace existing trace if it exists, otherwise shutil.move might fail on Mac directories
+            if os.path.exists(mlx_trace_filename):
+                shutil.rmtree(mlx_trace_filename)
+
+            shutil.move("sglang_tmp.gputrace", mlx_trace_filename)
+            stage_desc = f"for {stage}" if stage else ""
+            rank_print(f"MLX Metal gputrace {stage_desc} saved to {mlx_trace_filename}")
+        return
+
     if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStop()
@@ -454,8 +479,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=get_attention_tp_size(),
-            attn_cp_size=model_runner.attn_cp_size,
+            attn_tp_size=1,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
