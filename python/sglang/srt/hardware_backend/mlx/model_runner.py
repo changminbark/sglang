@@ -29,6 +29,26 @@ class MlxRequestState:
     generated_tokens: int = 0
 
 
+# Named tuple-like container returned by the async start methods.
+@dataclass
+class MlxPendingDecode:
+    """Lazy decode state to be finalized after mx.eval()."""
+
+    lazy_tokens: mx.array
+    batch_cache: list
+    decode_reqs: list  # list[tuple[str, MlxRequestState]]
+
+
+@dataclass
+class MlxPendingPrefill:
+    """Lazy prefill state to be finalized after mx.eval()."""
+
+    lazy_token: mx.array
+    cache: list
+    req_id: str
+    token_ids: list[int]
+
+
 def _merge_kv_caches(
     caches_list: list[list],
 ) -> list:
@@ -88,6 +108,9 @@ class MlxModelRunner:
         self.trust_remote_code = trust_remote_code
         self.model = None
         self._request_states: dict[str, MlxRequestState] = {}
+        # Counter used to trigger periodic mx.clear_cache() calls.
+        self._decode_step_ct: int = 0
+        self.generation_stream: mx.Stream = mx.new_stream(mx.default_device())
 
         self._load_model()
 
@@ -296,6 +319,183 @@ class MlxModelRunner:
             state.generated_tokens += 1
 
         return next_tokens
+
+    # ------------------------------------------------------------------
+    # Async (lazy-eval) API for overlap scheduling
+    # ------------------------------------------------------------------
+
+    def prefill_start(self, req_id: str, token_ids: list[int]) -> MlxPendingPrefill:
+        """Queue a prefill forward pass without evaluating.
+
+        Returns an :class:`MlxPendingPrefill` containing the lazy next-token
+        ``mx.array``.  Call ``mx.async_eval(pending.lazy_token)`` to kick off
+        GPU work, then :meth:`prefill_finalize`.
+        """
+        with mx.stream(self.generation_stream):
+            existing_state = self._request_states.get(req_id)
+            if existing_state is not None:
+                cached_input_len = (
+                    len(existing_state.token_ids) - existing_state.generated_tokens
+                )
+                new_tokens = token_ids[cached_input_len:]
+                cache = existing_state.cache
+            else:
+                new_tokens = token_ids
+                cache = make_prompt_cache(self.model)
+
+            input_ids = mx.array([new_tokens], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+            logits = self._extract_logits(model_output)
+            lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+
+            return MlxPendingPrefill(
+                lazy_token=lazy_token,
+                cache=cache,
+                req_id=req_id,
+                token_ids=token_ids,
+            )
+
+    def prefill_finalize(self, pending: MlxPendingPrefill) -> int:
+        """Materialise a pending prefill and store per-request state.
+
+        Must be called *after* ``mx.async_eval(pending.lazy_token)`` has been called.
+        """
+        with mx.stream(self.generation_stream):
+            # Evaluate lazy tokens/sync MLX computation graph
+            next_token = int(pending.lazy_token.item())
+            self._request_states[pending.req_id] = MlxRequestState(
+                token_ids=list(pending.token_ids) + [next_token],
+                cache=pending.cache,
+                generated_tokens=1,
+            )
+            return next_token
+
+    def decode_batch_start(self, req_ids: list[str]) -> MlxPendingDecode:
+        """Queue a decode forward pass without evaluating.
+
+        Returns an :class:`MlxPendingDecode` containing the lazy ``mx.array``
+        of next-token indices plus the references needed by
+        :meth:`decode_batch_finalize`.  The caller should call
+        ``mx.async_eval(pending.lazy_tokens)`` to kick off GPU computation,
+        then do CPU scheduling work, then call :meth:`decode_batch_finalize`
+        (after ``mx.eval``) to materialise the tokens and update state.
+        """
+        with mx.stream(self.generation_stream):
+            if len(req_ids) == 1:
+                req_id = req_ids[0]
+                state = self._request_states[req_id]
+                last_token = state.token_ids[-1]
+                input_ids = mx.array([[last_token]], dtype=mx.int32)
+                model_output = self.model(input_ids, cache=state.cache)
+                logits = self._extract_logits(model_output)
+                lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+                return MlxPendingDecode(
+                    lazy_tokens=lazy_token,
+                    batch_cache=state.cache,
+                    decode_reqs=[(req_id, state)],
+                )
+
+            decode_reqs = [(rid, self._request_states[rid]) for rid in req_ids]
+            last_tokens = [state.token_ids[-1] for _, state in decode_reqs]
+            caches_list = [state.cache for _, state in decode_reqs]
+            batch_cache = _merge_kv_caches(caches_list)
+
+            batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
+            model_output = self.model(batched_input, cache=batch_cache)
+            logits = self._extract_logits(model_output)
+            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+
+            return MlxPendingDecode(
+                lazy_tokens=lazy_tokens,
+                batch_cache=batch_cache,
+                decode_reqs=decode_reqs,
+            )
+
+    def decode_batch_start_chained(
+        self,
+        prev: MlxPendingDecode,
+    ) -> MlxPendingDecode:
+        """Build the next decode step on top of a still-lazy previous decode.
+
+        We feed ``prev.lazy_tokens`` (an unevaluated ``mx.array`` of shape
+        ``(B,)``) directly as the next step's input ids, reusing
+        ``prev.batch_cache`` in-place so that the KV cache updates from
+        step N and step N+1 live in the same tensors. MLX tracks the full
+        dependency graph, so once ``mx.async_eval`` is called the GPU
+        executes N+1 immediately after N with no gap.
+
+        Caller contract:
+        * ``prev`` MUST refer to the same set of requests as the batch the
+          caller intends to run next (no composition change).
+        * After calling this, finalize ``prev`` BEFORE finalizing the
+          returned pending: state bookkeeping for step N has to happen
+          before step N+1's bookkeeping.
+        * Only the FINAL pending in the chain may extract per-request
+          caches (see ``decode_batch_finalize``'s ``extract_cache`` flag),
+          because the ``batch_cache`` is shared across all chained steps
+          and reflects the latest state after every chained call.
+        """
+        with mx.stream(self.generation_stream):
+            # prev.lazy_tokens has shape (B,) — add seq dim to get (B, 1)
+            batched_input = prev.lazy_tokens[:, None]  # still a graph node
+            model_output = self.model(
+                batched_input, cache=prev.batch_cache
+            )  # update batch_cache
+            logits = self._extract_logits(model_output)
+            next_lazy = mx.argmax(logits[:, -1, :], axis=-1)
+
+            return MlxPendingDecode(
+                lazy_tokens=next_lazy,
+                batch_cache=prev.batch_cache,  # shared across the chain
+                decode_reqs=prev.decode_reqs,  # identical req set
+            )
+
+    def decode_batch_finalize(
+        self,
+        pending: MlxPendingDecode,
+        extract_cache: bool = True,
+    ) -> list[int]:
+        """Materialise a pending decode and update per-request state.
+
+        The call to ``pending.lazy_tokens.tolist()`` below implicitly blocks
+        until that specific lazy array is evaluated, so the caller does NOT
+        need to call ``mx.eval`` ahead of time. It only needs to have
+        previously handed the pending's outputs to ``mx.async_eval`` (or
+        trust that something downstream in the MLX graph will).
+
+        Args:
+            pending: The lazy decode returned by :meth:`decode_batch_start`
+                or :meth:`decode_batch_start_chained`.
+            extract_cache: If True, snapshot the batched KV cache back into
+                each request's ``state.cache``. Pass ``False`` when this
+                pending is mid-chain — i.e. another step has already been
+                built on top of ``pending.batch_cache`` via
+                :meth:`decode_batch_start_chained` — because the shared
+                ``batch_cache`` now reflects the later step's state, not
+                this one's. Only the tail of a chain should extract.
+        """
+        with mx.stream(self.generation_stream):
+            # Evaluate lazy tokens/sync MLX computation graph
+            raw = pending.lazy_tokens.tolist()
+            if not isinstance(raw, list):
+                raw = [raw]
+            # Extract next tokens for each batch
+            next_tokens = [int(t) for t in raw]
+
+            is_batched = len(pending.decode_reqs) > 1
+            # Update each batch's state
+            for i, (_, state) in enumerate(pending.decode_reqs):
+                if is_batched and extract_cache:
+                    state.cache = _extract_kv_cache(pending.batch_cache, i)
+                state.token_ids.append(next_tokens[i])
+                state.generated_tokens += 1
+
+            # Clear KV cache after enough decode passes
+            self._decode_step_ct += 1
+            if self._decode_step_ct % 256 == 0:
+                mx.clear_cache()
+
+            return next_tokens
 
     def remove_request(self, req_id: str):
         """Clean up state for a completed request."""

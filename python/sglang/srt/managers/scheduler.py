@@ -1387,46 +1387,199 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        if use_mlx() and self.is_generation:
+            self._event_loop_overlap_mlx()
+        else:
+            while True:
+                # Receive requests
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                if self._engine_paused:
+                    continue
+
+                # Get the next batch to run
+                batch = self.get_next_batch_to_run()
+                self.cur_batch = batch
+                disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+                # If we do not need to overlap the current batch with the last batch,
+                # we can process the last batch immediately.
+                if disable_overlap_for_batch:
+                    pop_and_process()
+
+                # Launch the current batch
+                if batch:
+                    batch_result = self.run_batch(batch)
+                    self.result_queue.append((batch.copy(), batch_result))
+                else:
+                    batch_result = None
+                    self.cancel_bubble_timer()
+
+                # Process the last batch
+                if self.last_batch:
+                    if not disable_overlap_for_batch:
+                        pop_and_process()
+                elif batch is None:
+                    # When the server is idle, do self-check and re-init some states
+                    self.self_check_during_idle()
+
+                # Run sample of the current batch
+                # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+                if self.is_generation:
+                    self.launch_batch_sample_if_needed(batch_result)
+
+                # Update last_batch
+                self.last_batch = batch
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                    self.self_check_during_busy()
+
+    def _event_loop_overlap_mlx(self):
+        """MLX-specific overlap loop modelled on ``mlx_lm.generate.generate_step``.
+
+        At steady state we keep TWO in-flight MLX graphs on the generation
+        stream:
+
+        * ``pending_curr`` — the step whose tokens we are about to block on
+          and feed into the scheduler's bookkeeping.
+        * ``pending_next`` — the step that was built on top of
+          ``pending_curr``'s still-lazy output tokens via
+          ``async_chained_decode_mlx`` and has already been handed to
+          ``mx.async_eval``. Because MLX tracks the full dependency graph,
+          the GPU will execute ``pending_next`` back-to-back with
+          ``pending_curr`` — there is no scheduling gap on the device.
+
+        Bookkeeping timeline for a steady-state decode loop:
+
+            iter k:
+              build pending_next  (CPU graph build + mx.async_eval; cheap)
+              block on pending_curr via .tolist() (wait only on curr's tokens)
+              process_batch_result(pending_curr)   <-- GPU is running pending_next
+              pending_curr = pending_next
+
+        The chain is broken (we fall back to a "schedule + launch" step)
+        whenever any of the following holds:
+
+        * ``pending_curr`` is not a pure decode (e.g. prefill/extend).
+        * The waiting queue has new requests that need prefill.
+        * Any req in ``pending_curr`` just finished this iteration, so the
+          composition for ``pending_next`` would need to shrink.
+
+        When the chain breaks mid-flight we still finalise the already-
+        launched ``pending_next`` normally (its tokens are valid for all
+        surviving reqs). We pass ``extract_cache=True`` to the LAST finalise
+        in a chain so per-request caches get snapshotted back into
+        ``state.cache`` before any non-chained op runs on them.
+        """
+        # ``pending_*`` tuple layout:
+        #   (lazy_tokens, prefill, decode, mode, batch_copy, reqs)
+        pending_curr: Optional[tuple] = None
+        pending_next: Optional[tuple] = None
+
+        def _finalize(pending: tuple, extract_cache: bool):
+            _, pref, dec, mode, batch_copy, reqs_snapshot = pending
+            result = self.tp_worker.finalize_mlx_result(
+                pref,
+                dec,
+                mode,
+                reqs_snapshot,
+                extract_cache=extract_cache,
+            )
+            if result.next_token_ids is not None:
+                batch_copy.output_ids = result.next_token_ids
+            self.process_batch_result(batch_copy, result)
+
+        def _launch_fresh(batch: ScheduleBatch) -> tuple:
+            mwb = batch.get_model_worker_batch()
+            lazy_tokens, pref, dec, mode = (
+                self.tp_worker.async_forward_batch_generation_mlx(mwb)
+            )
+            return (
+                lazy_tokens,
+                pref,
+                dec,
+                mode,
+                batch.copy(),
+                list(batch.reqs),
+            )
+
+        def _launch_chained(prev: tuple) -> tuple:
+            prev_decode = prev[2]  # MlxPendingDecode
+            prev_batch_copy = prev[4]
+            prev_reqs = prev[5]
+            lazy_tokens, pref, dec, mode = self.tp_worker.async_chained_decode_mlx(
+                prev_decode
+            )
+            # Composition is identical to prev: reuse a fresh batch copy
+            # of the same underlying ScheduleBatch so process_batch_result
+            # updates the same req objects with the new token.
+            return (
+                lazy_tokens,
+                pref,
+                dec,
+                mode,
+                prev_batch_copy.copy(),
+                prev_reqs,
+            )
+
         while True:
-            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
-            # Get the next batch to run
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            # 1. If pending_curr is a pure decode AND no new prefill is waiting,
+            #    build pending_next on top of it NOW — before we block on curr.
+            can_chain = (
+                pending_curr is not None
+                and pending_curr[3] == "decode"
+                and not self.waiting_queue
+            )
+            if can_chain and pending_next is None:
+                # Build + launch the chained step BEFORE we block on
+                # pending_curr — this is the "no idle gap" trick.
+                pending_next = _launch_chained(
+                    pending_curr
+                )  # GPU now has 2 steps queued
 
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
-            if disable_overlap_for_batch:
-                pop_and_process()
+            # 2. Finalize/process on pending_curr's tokens. Because pending_next is still
+            #    referencing curr's batch_cache, extract_cache=False.
+            if pending_curr is not None:
+                _finalize(pending_curr, extract_cache=(pending_next is None))
+                pending_curr = None
+            # ^ while this block returns, GPU is executing pending_next.
 
-            # Launch the current batch
-            if batch:
-                batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+            # 3. Decide whether pending_next is still valid and promote it.
+            finished_any = any(
+                req.finished() for req in (pending_next[5] if pending_next else [])
+            )
+            new_prefill_waiting = bool(self.waiting_queue)
+            if (
+                pending_next is not None
+                and not finished_any
+                and not new_prefill_waiting
+            ):
+                pending_curr = pending_next
+                pending_next = None
+                self.cur_batch = pending_curr[4]
+                self.last_batch = pending_curr[4]
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                    self.self_check_during_busy()
+                continue
+
+            # 4. Chain is broken. Finalise pending_next (if any) with extract_cache=True
+            #    so per-req caches get snapshotted back, then schedule fresh.
+            if pending_next is not None:
+                _finalize(pending_next, extract_cache=True)
+                pending_next = None
+            next_batch = self.get_next_batch_to_run()
+            self.cur_batch = next_batch
+            if next_batch:
+                pending_curr = _launch_fresh(next_batch)
             else:
-                batch_result = None
                 self.cancel_bubble_timer()
-
-            # Process the last batch
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
-
-            # Update last_batch
-            self.last_batch = batch
+            self.last_batch = next_batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -2731,7 +2884,8 @@ class Scheduler(
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
-
+                # MLX overlap scheduling is handled entirely in event_loop_overlap
+                # and never routes through run_batch, so this block is CUDA-only.
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
