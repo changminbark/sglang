@@ -1387,8 +1387,13 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if use_mlx() and self.is_generation:
-            self._event_loop_overlap_mlx()
+        if use_mlx():
+            if self.is_generation:
+                self._event_loop_overlap_mlx()
+            else:
+                raise ValueError(
+                    f"Invalid {self.server_args.disable_overlap_schedule=} for MLX (only generation supported)"
+                )
         else:
             while True:
                 # Receive requests
