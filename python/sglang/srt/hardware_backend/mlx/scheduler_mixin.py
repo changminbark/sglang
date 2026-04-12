@@ -174,7 +174,7 @@ class SchedulerMlxOverlapMixin:
                 pending_curr = _launch_fresh(next_batch)
             else:
                 self.cancel_bubble_timer()
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.last_batch = next_batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
