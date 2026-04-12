@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from python.sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -779,6 +780,7 @@ class ServerArgs:
         self._handle_cpu_backends()
         self._handle_npu_backends()
         self._handle_xpu_backends()
+        self._handle_mps_backends()
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -1096,6 +1098,11 @@ class ServerArgs:
                     " flag and disabling piecewise CUDA graph."
                 )
             self.disable_piecewise_cuda_graph = True
+
+    def _handle_mps_backends(self):
+        if self.device == "mps":
+            if not use_mlx():
+                self.disable_overlap_schedule = True
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
