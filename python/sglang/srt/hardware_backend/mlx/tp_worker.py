@@ -118,10 +118,13 @@ class MlxTpModelWorker(TpModelWorker):
 
         # Auto-cleanup: remove MLX state for requests no longer in the batch
         current_rids = {req.rid for req in reqs}
-        stale_rids = self._mlx_active_rids - current_rids
-        for rid in stale_rids:
-            self._mlx_runner.remove_request(rid)
-        self._mlx_active_rids = current_rids
+        if forward_mode.is_decode():
+            stale_rids = self._mlx_active_rids - current_rids
+            for rid in stale_rids:
+                self._mlx_runner.remove_request(rid)
+            self._mlx_active_rids = current_rids
+        else:
+            self._mlx_active_rids |= current_rids
 
         next_token_ids_list = []
 
@@ -206,10 +209,13 @@ class MlxTpModelWorker(TpModelWorker):
 
         # Auto-cleanup stale requests
         current_rids = {req.rid for req in reqs}
-        stale_rids = self._mlx_active_rids - current_rids
-        for rid in stale_rids:
-            self._mlx_runner.remove_request(rid)
-        self._mlx_active_rids = current_rids
+        if forward_mode.is_decode():
+            stale_rids = self._mlx_active_rids - current_rids
+            for rid in stale_rids:
+                self._mlx_runner.remove_request(rid)
+            self._mlx_active_rids = current_rids
+        else:
+            self._mlx_active_rids |= current_rids
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
@@ -376,14 +382,12 @@ class MlxTpModelWorker(TpModelWorker):
             # Finalize mixed-mode decodes and update per-request state
             if decode:
                 decode_results: dict[str, int] = {}
-                if decode is not None:
-                    mixed_tokens = self._mlx_runner.decode_batch_finalize(
-                        decode, extract_cache=extract_cache
-                    )
-                    decode_results = {
-                        rid: tok
-                        for (rid, _), tok in zip(decode.decode_reqs, mixed_tokens)
-                    }
+                mixed_tokens = self._mlx_runner.decode_batch_finalize(
+                    decode, extract_cache=extract_cache
+                )
+                decode_results = {
+                    rid: tok for (rid, _), tok in zip(decode.decode_reqs, mixed_tokens)
+                }
             else:
                 decode_results = {}
 

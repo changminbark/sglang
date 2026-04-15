@@ -483,7 +483,7 @@ class MlxModelRunner:
             next_tokens = [int(t) for t in raw]
 
             is_batched = len(pending.decode_reqs) > 1
-            # Update each batch's state
+            # Update each request's state
             for i, (_, state) in enumerate(pending.decode_reqs):
                 if is_batched and extract_cache:
                     state.cache = _extract_kv_cache(pending.batch_cache, i)

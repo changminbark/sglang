@@ -16,13 +16,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from python.sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.environ import envs
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -137,11 +137,13 @@ class SchedulerMlxOverlapMixin:
                 pending_next = _launch_chained(
                     pending_curr
                 )  # GPU now has 2 steps queued
+                self.result_queue.append(pending_next)
 
             # 2. Finalize/process on pending_curr's tokens. Because pending_next is still
             #    referencing curr's batch_cache, extract_cache=False.
             if pending_curr is not None:
                 _finalize(pending_curr, extract_cache=(pending_next is None))
+                self.result_queue.popleft()
                 pending_curr = None
             # ^ while this block returns, GPU is executing pending_next.
 
@@ -167,13 +169,14 @@ class SchedulerMlxOverlapMixin:
             #    so per-req caches get snapshotted back, then schedule fresh.
             if pending_next is not None:
                 _finalize(pending_next, extract_cache=True)
+                self.result_queue.popleft()
                 pending_next = None
             next_batch = self.get_next_batch_to_run()
             self.cur_batch = next_batch
             if next_batch:
                 pending_curr = _launch_fresh(next_batch)
+                self.result_queue.append(pending_curr)
             else:
-                self.cancel_bubble_timer()
                 self.on_idle()
 
             self.last_batch = next_batch
