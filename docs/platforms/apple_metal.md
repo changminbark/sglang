@@ -21,7 +21,7 @@ uv pip install -e "python[all_mps]"
 
 ## Features
 
-Overlap scheduling using `mlx.async_eval()` is enabled by default. To disable this, use the `--disable-overlap` flag.
+Overlap scheduling using `mlx.async_eval()` is enabled by default. To disable this, use the `--disable-overlap-schedule` flag.
 
 ## Benchmarking
 

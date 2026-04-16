@@ -356,7 +356,7 @@ class Scheduler(
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_overlap_cuda = self.enable_overlap and not use_mlx()
+        self.enable_overlap_torch = self.enable_overlap and not use_mlx()
         self.enable_overlap_mlx = self.enable_overlap and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -1042,7 +1042,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap_cuda:
+        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap_torch:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -1184,7 +1184,7 @@ class Scheduler(
             self.copy_stream
         )
 
-        if not self.enable_overlap_cuda:
+        if not self.enable_overlap_torch:
             self.future_map = None
             return
 
@@ -2245,7 +2245,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             model_config=self.model_config,
-            enable_overlap=self.enable_overlap_cuda,
+            enable_overlap=self.enable_overlap_torch,
             spec_algorithm=self.spec_algorithm,
         )
 
@@ -2750,7 +2750,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap_cuda:
+            if self.spec_algorithm.is_none() or self.enable_overlap_torch:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
@@ -2759,7 +2759,7 @@ class Scheduler(
                 worker_batch_or_batch = batch
 
             # CUDA Streams overlap scheduling enabled
-            if self.enable_overlap_cuda:
+            if self.enable_overlap_torch:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
@@ -2846,7 +2846,7 @@ class Scheduler(
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
 
-            if self.enable_overlap_cuda:
+            if self.enable_overlap_torch:
                 self.record_batch_in_overlap(model_worker_batch)
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3402,7 +3402,7 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap_cuda and self.last_batch:
+        if self.enable_overlap_torch and self.last_batch:
             # Process the results of the last batch (CUDA overlap only;
             # MLX overlap handles pending results in its own event loop).
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3630,7 +3630,7 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
-        elif scheduler.enable_overlap_cuda:
+        elif scheduler.enable_overlap_torch:
             scheduler.event_loop_overlap()
         else:
             scheduler.event_loop_normal()
