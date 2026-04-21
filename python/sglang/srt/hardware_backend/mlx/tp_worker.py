@@ -113,10 +113,6 @@ class MlxTpModelWorker(TpModelWorker):
             skip_attn_backend_init,
         )
 
-    # ------------------------------------------------------------------
-    # Auto-cleanup / stale-request bookkeeping
-    # ------------------------------------------------------------------
-
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
         """Remove MLX state for decode-mode requests that dropped out of the batch."""
         if forward_mode.is_decode():
@@ -126,10 +122,6 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids = current_rids
         else:
             self._mlx_active_rids |= current_rids
-
-    # ------------------------------------------------------------------
-    # Synchronous forward path (non-overlap scheduling)
-    # ------------------------------------------------------------------
 
     def _forward_batch_generation_mlx(
         self,
@@ -232,10 +224,6 @@ class MlxTpModelWorker(TpModelWorker):
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
         )
-
-    # ------------------------------------------------------------------
-    # Async forward path (overlap scheduling)
-    # ------------------------------------------------------------------
 
     def async_forward_batch_generation_mlx(
         self,

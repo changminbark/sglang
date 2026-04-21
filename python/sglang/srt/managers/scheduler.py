@@ -3453,6 +3453,7 @@ class Scheduler(
             return
 
         if self.enable_overlap_torch and self.last_batch:
+            # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 

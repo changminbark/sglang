@@ -21,20 +21,54 @@ uv pip install -e "python[all_mps]"
 
 ## Launch of the Serving Engine
 
-MLX inference is gated by the `SGLANG_USE_MLX=1` environment variable. Launch the server with:
+Launch the server with:
 
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.launch_server \
   --model <MODEL_ID_OR_PATH> \
-  --host 0.0.0.0 \
+  --disable-cuda-graph \
+  --host 0.0.0.0
 ```
 
-## Features
+**Key Parameters Explained:**
 
-Overlap scheduling using `mlx.async_eval()` is enabled by default. To disable this, use the `--disable-overlap-schedule` flag.
+1. `SGLANG_USE_MLX=1` - Enables the use of MLX as the SGLang runtime backend (if disabled, SGLang will fall back to `torch.mps`, which has less support)
+2. `--disable-cuda-graph` - Disables usage of CUDA graph, which is not relevant for Apple Metal.
+3. `--disable-overlap-schedule` - Disables overlap scheduling (enabled/not present by default) achieved using MLX's `async_eval()`
 
-## Benchmarking
 
-For benchmarking performance without overlap scheduling (synchronous MLX evaluation), use `sglang.benchmark_one_batch` as it calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.
+## Benchmarking with Requests
 
-For benchmarking performance with overlap scheduling, use `sglang.benchmark_offline_throughput` as it uses the scheduler and the overlap code path.
+`sglang.benchmark_one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.
+
+`sglang.benchmark_offline_throughput` can toggle overlap scheduling as it uses the scheduler and the overlap code path by using the flag `--disable-overlap-schedule`.
+
+### Throughput Testing
+
+Basic synchronous one batch throughput:
+```bash
+SGLANG_USE_MLX=1 python -m sglang.bench_one_batch \
+  --model-path <MODEL_ID_OR_PATH> \
+  --disable-cuda-graph \
+  --tp-size 1 \
+  --batch-size 1 \
+  --input-len 60 \
+  --output-len 10
+```
+
+Synchronous offline throughput:
+```bash
+SGLANG_USE_MLX=1 python -m sglang.bench_offline_throughput \
+  --model-path <MODEL_ID_OR_PATH> \
+  --disable-cuda-graph \
+  --num-prompts 1 \
+  --disable-overlap-schedule
+```
+
+Asynchronous offline throughput:
+```bash
+SGLANG_USE_MLX=1 python -m sglang.bench_offline_throughput \
+  --model-path <MODEL_ID_OR_PATH> \
+  --disable-cuda-graph \
+  --num-prompts 1
+```

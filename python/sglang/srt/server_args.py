@@ -788,8 +788,8 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
-        self._handle_xpu_backends()
         self._handle_mps_backends()
+        self._handle_xpu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
         from sglang.srt.platforms import current_platform
@@ -1143,6 +1143,11 @@ class ServerArgs:
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
 
+    def _handle_mps_backends(self):
+        if self.device == "mps":
+            if not use_mlx():
+                self.disable_overlap_schedule = True
+
     def _handle_xpu_backends(self):
         if self.device == "xpu":
             if not self.disable_piecewise_cuda_graph:
@@ -1151,11 +1156,6 @@ class ServerArgs:
                     " flag and disabling piecewise CUDA graph."
                 )
             self.disable_piecewise_cuda_graph = True
-
-    def _handle_mps_backends(self):
-        if self.device == "mps":
-            if not use_mlx():
-                self.disable_overlap_schedule = True
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)

@@ -263,10 +263,6 @@ class MlxModelRunner:
             f"{self._num_layers} layers, {n_kv_heads} kv_heads, {head_dim} head_dim"
         )
 
-    # ------------------------------------------------------------------
-    # Synchronous API (used when overlap scheduling is disabled)
-    # ------------------------------------------------------------------
-
     def prefill(
         self,
         req_id: str,
@@ -372,10 +368,6 @@ class MlxModelRunner:
         ]
         mx.eval(pending.lazy_tokens, *cache_arrays)
         return self.decode_batch_finalize(pending)
-
-    # ------------------------------------------------------------------
-    # Async (lazy-eval) API for overlap scheduling
-    # ------------------------------------------------------------------
 
     def prefill_start(
         self,
@@ -674,10 +666,6 @@ class MlxModelRunner:
             mx.clear_cache()
 
         return next_tokens
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     def has_request(self, req_id: str) -> bool:
         """Check if a request has active state."""
