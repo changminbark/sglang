@@ -1,6 +1,6 @@
-# Apple Silicon with Metal
+# Apple Silicon with Metal (MLX)
 
-This document describes how run SGLang on Apple Silicon using [Metal](https://developer.apple.com/metal/). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+This document describes how run SGLang on Apple Silicon using [Metal (MLX)](https://opensource.apple.com/projects/mlx/). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## Install SGLang
 
@@ -17,6 +17,16 @@ cd sglang
 pip install --upgrade pip
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 uv pip install -e "python[all_mps]"
+```
+
+## Launch of the Serving Engine
+
+MLX inference is gated by the `SGLANG_USE_MLX=1` environment variable. Launch the server with:
+
+```bash
+SGLANG_USE_MLX=1 python -m sglang.launch_server \
+  --model <MODEL_ID_OR_PATH> \
+  --host 0.0.0.0 \
 ```
 
 ## Features
