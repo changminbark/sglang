@@ -307,6 +307,7 @@ class MlxModelRunner:
         num_layers = len(cache)
         end = cache_start + len(slot_ids)
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
+        # TODO: Standardize ContiguousKVCache size to avoid transpose
         # Transpose cache (1, n_kv_heads, S, head_dim) → pool (S, n_kv_heads, head_dim)
         k_all = mx.stack(
             [
@@ -594,6 +595,9 @@ class MlxModelRunner:
         batch_size = len(prev.req_ids)
         num_layers = self._num_layers
         caches = prev.caches
+
+        # TODO (changminbark): Need to fix ContiguousKVCache.write_token
+        # to accommodate dynamic growing like ContiguousKVCache.update_and_fetch.
 
         # After prev's graph ran, each ContiguousKVCache.offset was
         # bumped by one per layer — attention wrapper's `write_token`

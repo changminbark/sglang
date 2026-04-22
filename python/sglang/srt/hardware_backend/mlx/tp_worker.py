@@ -272,6 +272,7 @@ class MlxTpModelWorker(TpModelWorker):
             return pending_decode.lazy_tokens, [], [], pending_decode, "decode"
 
         if forward_mode.is_extend():
+            # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
             # Ensure the pool is up-to-date before any PoolBackedCache
             # reads it for prefix-cached prefills. Mirror the sync path.
             self._mlx_runner.flush_all_decode_kv()
