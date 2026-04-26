@@ -166,13 +166,18 @@ class MlxModelRunner:
 
     @staticmethod
     def _cache_state_arrays(
-        cache: list[ContiguousKVCache | PoolBackedCache],
+        pending_caches: list[list[ContiguousKVCache | PoolBackedCache]],
     ) -> list[mx.array]:
-        """Flatten per-layer cache state tuples into an array list.
+        """Flatten pending decode cache state list into an array list.
 
-        Safe to hand to ``mx.async_eval`` — filters out empty states.
+        Safe to hand to ``mx.async_eval``.
         """
-        return [s for c in cache for s in c.state]
+        return [
+            s
+            for cache_list in pending_caches
+            for cache in cache_list
+            for s in cache.state
+        ]
 
     def _load_model(self):
         """Load model using mlx_lm."""
@@ -364,9 +369,7 @@ class MlxModelRunner:
         # Evaluate lazy_tokens together with every affected cache buffer so
         # the attention write-then-read ordering is materialised in one
         # kernel submission.
-        cache_arrays = [
-            arr for c_list in pending.caches for arr in self._cache_state_arrays(c_list)
-        ]
+        cache_arrays = self._cache_state_arrays(pending.caches)
         mx.eval(pending.lazy_tokens, *cache_arrays)
         return self.decode_batch_finalize(pending)
 
@@ -666,6 +669,7 @@ class MlxModelRunner:
             self._req_token_ids[rid].append(next_tokens[i])
 
         self._decode_step_ct += 1
+        # TODO (changminbark): allow for flag configuration for clearing mx cache
         if self._decode_step_ct % 256 == 0:
             mx.clear_cache()
 
