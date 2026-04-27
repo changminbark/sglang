@@ -67,7 +67,6 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hardware_backend.mlx.scheduler_mixin import SchedulerMlxOverlapMixin
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -240,8 +239,13 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
     CudaStreamContext = nullcontext
+    from sglang.srt.hardware_backend.mlx.scheduler_mixin import SchedulerMlxOverlapMixin
 else:
     from torch.cuda import StreamContext as CudaStreamContext
+
+    class SchedulerMlxOverlapMixin:
+        pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -375,9 +379,8 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_overlap_torch = self.enable_overlap and not use_mlx()
-        self.enable_overlap_mlx = self.enable_overlap and use_mlx()
+        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
+        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
@@ -1069,7 +1072,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap_torch:
+        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -1211,7 +1214,7 @@ class Scheduler(
             self.copy_stream
         )
 
-        if not self.enable_overlap_torch:
+        if not self.enable_overlap:
             self.future_map = None
             return
 
@@ -2296,7 +2299,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             model_config=self.model_config,
-            enable_overlap=self.enable_overlap_torch,
+            enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
         )
 
@@ -2821,7 +2824,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap_torch:
+            if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
@@ -2829,7 +2832,7 @@ class Scheduler(
                 # TODO(lsyin): delete this branch after unifying the abstraction.
                 worker_batch_or_batch = batch
 
-            if self.enable_overlap_torch:
+            if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
@@ -2914,7 +2917,7 @@ class Scheduler(
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
 
-            if self.enable_overlap_torch:
+            if self.enable_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3478,7 +3481,7 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap_torch and self.last_batch:
+        if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
@@ -3705,7 +3708,7 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
-        elif scheduler.enable_overlap_torch:
+        elif scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:
             scheduler.event_loop_normal()
